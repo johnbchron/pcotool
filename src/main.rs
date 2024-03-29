@@ -1,4 +1,5 @@
 mod asana;
+mod pco;
 mod secrets;
 
 use color_eyre::eyre::{OptionExt, Result};
@@ -27,11 +28,16 @@ async fn main() -> Result<()> {
   color_eyre::install()?;
 
   let secrets = secrets::Secrets::new()?;
-  let client = asana::AsanaClient::new(secrets.clone());
 
-  let task = client.get_task(1206957347414555).await?;
-  let linked_task = task.as_linked_task().ok_or_eyre("task is not linked")?;
-  tracing::info!("fetched task: {:?}", linked_task);
+  let asana_client = asana::AsanaClient::new(secrets.clone());
+  let pco_client = pco::PcoClient::new(secrets.clone());
+
+  // let task = asana_client.get_task(1206957347414555).await?;
+  // let linked_task = task.as_linked_task().ok_or_eyre("task is not linked")?;
+  // tracing::info!("fetched task: {:?}", linked_task);
+
+  let events = pco_client.fetch_all_events().await?;
+  tracing::info!("fetched {} events", events.len());
 
   Ok(())
 }
