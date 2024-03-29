@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 color-eyre = "0.6.3"
 reqwest = { version = "0.12.2", default-features = false, features = [ "http2", "json", "rustls-tls" ] }
+serde = { version = "1.0.197", features = ["derive"] }
 tokio = { version = "1.37.0", features = [ "full" ] }
 tracing = "0.1.40"
 tracing-error = "0.2.0"
