@@ -41,7 +41,7 @@
       in {
         devShell = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
-            pkg-config jq
+            jq bacon
             toolchain
           ];
         };
