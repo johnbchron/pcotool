@@ -1,8 +1,6 @@
 mod asana;
 mod secrets;
 
-use std::{collections::HashMap, sync::Arc};
-
 use color_eyre::eyre::Result;
 use tracing::instrument;
 
@@ -28,14 +26,14 @@ async fn main() -> Result<()> {
   install_tracing();
   color_eyre::install()?;
 
-  let secrets = Arc::new(secrets::Secrets::new()?);
+  let secrets = secrets::Secrets::new()?;
   tracing::info!("loaded secrets");
 
-  tracing::info!("making a request to httpbin");
-  let resp = reqwest::get("https://httpbin.org/ip")
-    .await?
-    .json::<HashMap<String, String>>()
-    .await?;
-  println!("{resp:#?}");
+  let client = asana::AsanaClient::new(secrets.clone());
+  tracing::info!("created asana client");
+
+  let task = client.get_task(1206957347414555).await?;
+  tracing::info!("task: {task:#?}");
+
   Ok(())
 }
