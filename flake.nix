@@ -21,7 +21,7 @@
       in {
         devShell = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
-            pkg-config openssl jq
+            pkg-config jq
             toolchain
           ];
         };
