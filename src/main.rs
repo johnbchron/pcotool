@@ -1,7 +1,7 @@
 mod asana;
 mod secrets;
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{OptionExt, Result};
 use tracing::instrument;
 
 fn install_tracing() {
@@ -34,6 +34,10 @@ async fn main() -> Result<()> {
 
   let task = client.get_task(1206957347414555).await?;
   tracing::info!("task: {task:#?}");
+
+  tracing::info!("converting to linked task");
+  let linked_task = task.into_linked_task().ok_or_eyre("task is not linked")?;
+  tracing::info!("linked task: {linked_task:#?}");
 
   Ok(())
 }
