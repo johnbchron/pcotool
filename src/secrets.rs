@@ -12,6 +12,7 @@ pub struct Secrets {
 }
 
 impl Secrets {
+  #[tracing::instrument(level = "debug")]
   pub fn new() -> Result<Self> {
     Ok(Self {
       asana_pat:           var("ASANA_PAT").wrap_err("ASANA_PAT is not set")?,

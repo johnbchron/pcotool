@@ -95,7 +95,7 @@ pub struct AsanaTask {
 }
 
 impl AsanaTask {
-  /// Extract the PCO event id from the html notes of the task.
+  /// Convert the task into a linked task.
   pub fn into_linked_task(self) -> Option<AsanaLinkedTask> {
     use scraper::{Html, Selector};
 
@@ -118,6 +118,11 @@ impl AsanaTask {
       task: self,
       event_id,
     })
+  }
+
+  /// Convert the task into a linked task.
+  pub fn as_linked_task(&self) -> Option<AsanaLinkedTask> {
+    self.clone().into_linked_task()
   }
 }
 

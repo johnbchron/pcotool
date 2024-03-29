@@ -10,7 +10,7 @@ fn install_tracing() {
 
   let fmt_layer = fmt::layer().with_target(false);
   let filter_layer = EnvFilter::try_from_default_env()
-    .or_else(|_| EnvFilter::try_new("info"))
+    .or_else(|_| EnvFilter::try_new("pcotool=debug,info"))
     .unwrap();
 
   tracing_subscriber::registry()
@@ -27,17 +27,11 @@ async fn main() -> Result<()> {
   color_eyre::install()?;
 
   let secrets = secrets::Secrets::new()?;
-  tracing::info!("loaded secrets");
-
   let client = asana::AsanaClient::new(secrets.clone());
-  tracing::info!("created asana client");
 
   let task = client.get_task(1206957347414555).await?;
-  tracing::info!("task: {task:#?}");
-
-  tracing::info!("converting to linked task");
-  let linked_task = task.into_linked_task().ok_or_eyre("task is not linked")?;
-  tracing::info!("linked task: {linked_task:#?}");
+  let linked_task = task.as_linked_task().ok_or_eyre("task is not linked")?;
+  tracing::info!("fetched task: {:?}", linked_task);
 
   Ok(())
 }
