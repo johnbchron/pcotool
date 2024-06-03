@@ -1,3 +1,3 @@
 
 run:
-	cargo run
+	RUST_LOG=pcotool=debug cargo run

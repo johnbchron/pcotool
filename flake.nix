@@ -41,7 +41,7 @@
       in {
         devShell = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
-            jq bacon
+            jq bacon tokio-console
             toolchain
           ];
         };
