@@ -1,22 +1,26 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use chrono::SecondsFormat;
 use color_eyre::{
   eyre::{OptionExt, Result, WrapErr},
   Section, SectionExt,
 };
+use futures::Stream;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::instrument;
 
-use crate::secrets::Secrets;
+use super::PCO_CONCURRENCY;
+use crate::{secrets::Secrets, DateTimeUtc};
 
 const URL_PREFIX: &str = "https://api.planningcenteronline.com/calendar/v2";
 
-#[derive(Clone)]
 pub struct PcoClient {
-  client:    reqwest::Client,
-  secrets:   Secrets,
-  semaphore: Arc<Semaphore>,
+  client:           reqwest::Client,
+  secrets:          Secrets,
+  semaphore:        Arc<Semaphore>,
+  cached_resources: Arc<Mutex<HashMap<String, PcoObject>>>,
 }
 
 impl PcoClient {
@@ -24,7 +28,8 @@ impl PcoClient {
     Self {
       client: reqwest::Client::new(),
       secrets,
-      semaphore: Arc::new(Semaphore::new(5)),
+      semaphore: Arc::new(Semaphore::new(PCO_CONCURRENCY)),
+      cached_resources: Arc::new(Mutex::new(HashMap::new())),
     }
   }
 
@@ -82,19 +87,75 @@ impl PcoClient {
     }
   }
 
-  /// Fetch events from the Planning Center Online API.
   #[instrument(skip(self))]
-  pub async fn fetch_events(
+  pub async fn fetch_event(&self, id: String) -> Result<PcoObject> {
+    let url = format!("{URL_PREFIX}/events/{id}");
+    self.fetch(&url, 0).await.and_then(|r| r.into_single())
+  }
+
+  #[instrument(skip(self))]
+  pub async fn fetch_resource_requests_for_event(
     &self,
+    event_id: String,
+  ) -> Result<Vec<PcoObject>> {
+    let url = format!("{URL_PREFIX}/events/{event_id}/event_resource_requests");
+    self.fetch(&url, 0).await.and_then(|r| r.into_data_vec())
+  }
+
+  #[instrument(skip(self))]
+  pub async fn fetch_resource(&self, resource_id: String) -> Result<PcoObject> {
+    let cached = self.cached_resources.lock().await;
+    if let Some(resource) = cached.get(&resource_id) {
+      return Ok(resource.clone());
+    }
+    drop(cached);
+
+    let url = format!("{URL_PREFIX}/resources/{resource_id}",);
+    let resource = self.fetch(&url, 0).await.and_then(|r| r.into_single())?;
+    self
+      .cached_resources
+      .lock()
+      .await
+      .insert(resource_id, resource.clone());
+
+    Ok(resource)
+  }
+
+  #[instrument(
+    skip(self),
+    fields(
+      start = start.to_rfc3339_opts(SecondsFormat::Secs, false),
+      end = end.to_rfc3339_opts(SecondsFormat::Secs, false)
+    )
+  )]
+  async fn fetch_event_instances_in_range(
+    &self,
+    start: DateTimeUtc,
+    end: DateTimeUtc,
     offset: Option<usize>,
   ) -> Result<PcoResponse> {
-    let url = format!("{URL_PREFIX}/events?offset={}", offset.unwrap_or(0));
+    let url = format!(
+      "{URL_PREFIX}/event_instances?where[starts_at][gte]={}&\
+       where[starts_at][lt]={}&offset={}",
+      start.to_rfc3339_opts(SecondsFormat::Secs, false),
+      end.to_rfc3339_opts(SecondsFormat::Secs, false),
+      offset.unwrap_or(0),
+    );
     self.fetch(&url, 0).await
   }
 
   #[instrument(skip(self))]
-  pub async fn fetch_all_events(&self) -> Result<Vec<PcoObject>> {
-    let initial_response = self.fetch_events(None).await?;
+  pub async fn fetch_all_event_instances_in_range(
+    self: &Arc<Self>,
+    start: DateTimeUtc,
+    end: DateTimeUtc,
+  ) -> Result<impl Stream<Item = Result<PcoObject>>> {
+    let (tx, rx) = mpsc::channel(100); // Create a channel with a buffer size of 100
+
+    let initial_response = self
+      .fetch_event_instances_in_range(start, end, None)
+      .await?;
+
     let total_count = match initial_response {
       PcoResponse::Multiple { meta, .. } => meta
         .get("total_count")
@@ -104,66 +165,35 @@ impl PcoClient {
       _ => color_eyre::eyre::bail!("unexpected single-item response"),
     };
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(5));
-    let mut tasks = Vec::new();
-
     let client = Arc::new(self.clone());
+
     for offset in (0..total_count).step_by(25) {
-      tasks.push(tokio::spawn({
-        let client = client.clone();
-        let semaphore = semaphore.clone();
-        async move {
-          let _permit = semaphore.acquire().await.unwrap();
-          client.fetch_events(Some(offset.try_into().unwrap())).await
+      let client = client.clone();
+      let tx = tx.clone();
+
+      tokio::spawn(async move {
+        let response = client
+          .fetch_event_instances_in_range(start, end, Some(offset as usize))
+          .await
+          .and_then(|r| r.into_data_vec());
+
+        match response {
+          Ok(data) => {
+            for item in data {
+              tx.send(Ok(item)).await.unwrap();
+            }
+          }
+          Err(e) => {
+            tx.send(Err(e)).await.unwrap();
+          }
         }
-      }))
+      });
     }
 
-    let mut events = Vec::new();
-    for task in tasks {
-      let response = task
-        .await
-        .wrap_err("failed to join task")?
-        .wrap_err("task failed")?;
-      events.extend(response.into_data_vec()?);
-    }
-    Ok(events)
-  }
+    // Drop the original sender to close the channel once all tasks are complete
+    drop(tx);
 
-  /// Fetch event instances from the Planning Center Online API.
-  #[instrument(skip(self))]
-  pub async fn fetch_instances(&self, event_id: &str) -> Result<PcoResponse> {
-    let url = format!("{URL_PREFIX}/events/{event_id}/event_instances");
-    self.fetch(&url, 0).await
-  }
-
-  /// Fetch resource bookings from the Planning Center Online API.
-  #[instrument(skip(self))]
-  pub async fn fetch_resource_bookings(
-    &self,
-    instance_id: &str,
-  ) -> Result<PcoResponse> {
-    let url =
-      format!("{URL_PREFIX}/event_instances/{instance_id}/resource_bookings");
-    self.fetch(&url, 0).await
-  }
-
-  /// Fetch event resource requests from the Planning Center Online API.
-  #[instrument(skip(self))]
-  pub async fn fetch_event_resource_requests(
-    &self,
-    event_id: &str,
-  ) -> Result<PcoResponse> {
-    let url =
-      format!("{URL_PREFIX}/events/{event_id}/event_resource_requests",);
-    self.fetch(&url, 0).await
-  }
-
-  /// Fetch a resource from the Planning Center Online API.
-  #[instrument(skip(self))]
-  pub async fn fetch_resource(&self, resource_id: &str) -> Result<PcoResponse> {
-    let url = format!("{URL_PREFIX}/resources/{resource_id}");
-    self.fetch(&url, 0).await
+    Ok(ReceiverStream::new(rx))
   }
 }
 

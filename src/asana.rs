@@ -2,12 +2,12 @@ use std::fmt::Debug;
 
 use color_eyre::{
   eyre::{Result, WrapErr},
-  Section, SectionExt,
+  Section,
 };
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use crate::{pco::PcoInstancedEvent, secrets::Secrets};
+use crate::secrets::Secrets;
 
 /// The error type returned by the Asana API.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -157,60 +157,60 @@ impl AsanaClient {
     Ok(results)
   }
 
-  /// Create an Asana task from a [`PcoInstancedEvent`].
-  #[instrument(skip(self))]
-  pub async fn create_task(
-    &self,
-    ie: PcoInstancedEvent,
-  ) -> Result<AsanaResponse<AsanaTask>> {
-    let url = "https://app.asana.com/api/1.0/tasks";
+  // /// Create an Asana task from a [`PcoInstancedEvent`].
+  // #[instrument(skip(self))]
+  // pub async fn create_task(
+  //   &self,
+  //   ie: PcoInstancedEvent,
+  // ) -> Result<AsanaResponse<AsanaTask>> {
+  //   let url = "https://app.asana.com/api/1.0/tasks";
 
-    let local_starts_at =
-      ie.starts_at.with_timezone(&chrono_tz::America::Chicago);
-    let name = format!(
-      "{} - {}",
-      ie.event_name.trim(),
-      local_starts_at.format("%m-%d-%Y")
-    );
-    let html_notes = format!(
-      "<body>\n<code>&gt;&gt;&gt;&gt;&gt; {event_id}:{instance_id} \
-       &lt;&lt;&lt;&lt;&lt;</code></body>",
-      event_id = ie.event_id,
-      instance_id = ie.instance_id
-    );
+  //   let local_starts_at =
+  //     ie.starts_at.with_timezone(&chrono_tz::America::Chicago);
+  //   let name = format!(
+  //     "{} - {}",
+  //     ie.event_name.trim(),
+  //     local_starts_at.format("%m-%d-%Y")
+  //   );
+  //   let html_notes = format!(
+  //     "<body>\n<code>&gt;&gt;&gt;&gt;&gt; {event_id}:{instance_id} \
+  //      &lt;&lt;&lt;&lt;&lt;</code></body>",
+  //     event_id = ie.event_id,
+  //     instance_id = ie.instance_id
+  //   );
 
-    let request_payload = serde_json::json!({
-      "data": {
-        "projects": [
-          self.secrets.asana_project_gid.to_string()
-        ],
-        "name": name,
-        "due_at": ie.starts_at.to_rfc3339(),
-        "html_notes": html_notes,
-      },
-    });
+  //   let request_payload = serde_json::json!({
+  //     "data": {
+  //       "projects": [
+  //         self.secrets.asana_project_gid.to_string()
+  //       ],
+  //       "name": name,
+  //       "due_at": ie.starts_at.to_rfc3339(),
+  //       "html_notes": html_notes,
+  //     },
+  //   });
 
-    let req = self
-      .client
-      .post(url)
-      .query(&[("opt_fields", "name,html_notes")])
-      .bearer_auth(&self.secrets.asana_pat)
-      .json(&request_payload);
+  //   let req = self
+  //     .client
+  //     .post(url)
+  //     .query(&[("opt_fields", "name,html_notes")])
+  //     .bearer_auth(&self.secrets.asana_pat)
+  //     .json(&request_payload);
 
-    let resp = req.send().await.wrap_err("failed to fetch")?;
+  //   let resp = req.send().await.wrap_err("failed to fetch")?;
 
-    // deserialize to PcoResponse
-    let text_resp = resp
-      .text()
-      .await
-      .wrap_err("failed to decode asana response as utf-8 plaintext")?;
-    let json_resp =
-      serde_json::from_str::<AsanaResponse<AsanaTask>>(&text_resp)
-        .wrap_err("failed to parse asana json response")
-        .with_section(|| text_resp.header("Original Response:"))?;
+  //   // deserialize to PcoResponse
+  //   let text_resp = resp
+  //     .text()
+  //     .await
+  //     .wrap_err("failed to decode asana response as utf-8 plaintext")?;
+  //   let json_resp =
+  //     serde_json::from_str::<AsanaResponse<AsanaTask>>(&text_resp)
+  //       .wrap_err("failed to parse asana json response")
+  //       .with_section(|| text_resp.header("Original Response:"))?;
 
-    Ok(json_resp)
-  }
+  //   Ok(json_resp)
+  // }
 }
 
 /// A task from the Asana API.

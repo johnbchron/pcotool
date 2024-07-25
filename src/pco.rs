@@ -1,299 +1,128 @@
 pub mod client;
 
-use std::{ops::Deref, sync::Arc};
+use std::sync::Arc;
 
-use color_eyre::eyre::{OptionExt, Report, Result};
+use color_eyre::eyre::Result;
+use futures::{future::ready, stream::BoxStream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{self, Sender};
 
 use self::client::{PcoClient, PcoObject};
-use crate::DateTimeUtc;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PcoInstancedEvent {
-  pub event_id:          String,
-  pub event_name:        String,
-  pub starts_at:         DateTimeUtc,
-  pub ends_at:           DateTimeUtc,
-  pub event_url:         String,
-  pub instance_id:       String,
-  pub instance_url:      String,
-  pub resource_requests: Vec<PcoResourceRequestWithResource>,
+pub const PCO_CONCURRENCY: usize = 4;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PcoEventWithRequestedResources {
+  pub event:               PcoObject,
+  pub requested_resources: Vec<PcoObject>,
 }
 
-impl PcoInstancedEvent {
-  pub fn from_pieces(
-    event: PcoObject,
-    instance: PcoObject,
-    resource_requests: Vec<PcoResourceRequestWithResource>,
-  ) -> Option<Self> {
-    tracing::info!(
-      "event_instance recurrence_description: `{}`",
-      instance
-        .attributes
-        .as_ref()
-        .and_then(|h| h.get("recurrence_description"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("none")
-    );
-    Some(Self {
-      event_id: event.id,
-      event_name: event
-        .attributes
-        .as_ref()?
-        .get("name")?
-        .as_str()?
-        .to_string(),
-      starts_at: instance
-        .attributes
-        .as_ref()?
-        .get("starts_at")?
-        .as_str()?
-        .parse()
-        .ok()?,
-      ends_at: instance
-        .attributes
-        .as_ref()?
-        .get("ends_at")?
-        .as_str()?
-        .parse()
-        .ok()?,
-      event_url: event
-        .links
-        .as_ref()?
-        .get("html")?
-        .as_ref()?
-        .as_str()
-        .to_string(),
-      instance_id: instance.id,
-      instance_url: instance
-        .attributes
-        .as_ref()?
-        .get("church_center_url")?
-        .as_str()?
-        .to_string(),
-      resource_requests,
-    })
-  }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum PcoApprovalStatus {
-  Approved,
-  Pending,
-  Rejected,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PcoResourceRequest {
-  pub id:              String,
-  pub approval_status: PcoApprovalStatus,
-  pub quantity:        i64,
-  pub resource_id:     String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PcoResourceRequestWithResource {
-  pub resource_request: PcoResourceRequest,
-  pub resource_name:    String,
-}
-
-impl PcoResourceRequest {
-  pub fn from_object(object: PcoObject) -> Option<Self> {
-    let approval_status = match object
-      .attributes
-      .as_ref()?
-      .get("approval_status")?
-      .as_str()?
-    {
-      "A" => PcoApprovalStatus::Approved,
-      "P" => PcoApprovalStatus::Pending,
-      "R" => PcoApprovalStatus::Rejected,
-      p => {
-        tracing::error!(
-          "got unexpected event_resource_request approval_status: {p}"
-        );
-        None?
-      }
-    };
-    let resource_id = object
-      .relationships
-      .as_ref()?
-      .get("resource")?
-      .as_object()?
-      .get("data")?
-      .as_object()?
-      .get("id")?
-      .as_str()?
-      .to_string();
-    Some(PcoResourceRequest {
-      id: object.id,
-      approval_status,
-      quantity: object.attributes.as_ref()?.get("quantity")?.as_i64()?,
-      resource_id,
-    })
-  }
-
-  pub async fn fetch_resource(
-    self,
-    client: impl Deref<Target = PcoClient>,
-  ) -> Result<PcoResourceRequestWithResource> {
-    let resource = client
-      .fetch_resource(&self.resource_id)
-      .await?
-      .into_single()?;
-    let resource_name = resource
-      .attributes
-      .as_ref()
-      .ok_or_eyre("no attributes present in response")?
-      .get("name")
-      .ok_or_eyre("no name in attributes")?
-      .as_str()
-      .ok_or_eyre("name attribute is not string")?
-      .to_string();
-
-    Ok(PcoResourceRequestWithResource {
-      resource_request: self,
-      resource_name,
-    })
-  }
-}
-
-async fn handle_event_with_instances(
+#[tracing::instrument(skip(client))]
+pub async fn find_relevant_events(
   client: Arc<PcoClient>,
-  tx: Sender<PcoInstancedEvent>,
-  event: PcoObject,
-  instances: Vec<PcoObject>,
-) -> Result<()> {
-  // filter the instances based on time.
-  // the `starts_at` attribute must be more recent than 1 week ago.
-  let original_count = instances.len();
-  let instances = instances
-    .into_iter()
-    .filter(|i| {
-      let instance_starts_at = chrono::DateTime::<chrono::Utc>::from(
-        chrono::DateTime::parse_from_rfc3339(
-          i.attributes
-            .as_ref()
-            .unwrap()
-            .get("starts_at")
-            .unwrap()
-            .as_str()
-            .unwrap(),
-        )
-        .unwrap(),
-      );
-      instance_starts_at > chrono::Utc::now()
-        && instance_starts_at - chrono::Duration::days(7 * 6)
-          < chrono::Utc::now()
-    })
-    .collect::<Vec<_>>();
+) -> impl futures::Stream<Item = Result<PcoEventWithRequestedResources>> {
+  let start_date = chrono::Utc::now();
+  let end_date = start_date + chrono::Duration::weeks(8);
 
-  if instances.len() < original_count {
-    tracing::debug!(
-      "filtered {} event instance{} for event {} based on timing",
-      original_count - instances.len(),
-      if original_count - instances.len() == 1 {
-        ""
-      } else {
-        "s"
-      },
-      event.id
-    );
+  let event_instance_stream = client
+    .fetch_all_event_instances_in_range(start_date, end_date)
+    .await;
+  if let Err(e) = event_instance_stream {
+    return Box::pin(futures::stream::once(ready(Err(e)))) as BoxStream<_>;
   }
+  let event_instance_stream = event_instance_stream.unwrap();
 
-  let resource_requests = client
-    .fetch_event_resource_requests(&event.id)
-    .await?
-    .into_data_vec()?;
-
-  let mut resourse_requests_with_resources = Vec::new();
-  for resource_request in resource_requests {
-    let resource_request_with_resource =
-      PcoResourceRequest::from_object(resource_request)
-        .ok_or_eyre("failed to build `PcoResourceRequest` from `PcoObject`")?
-        .fetch_resource(client.clone())
-        .await
-        .map_err(|e| {
-          tracing::error!("failed to fetch_accompanying resource: {e}");
-          e
-        })?;
-    resourse_requests_with_resources.push(resource_request_with_resource);
-  }
-
-  // iterate through the instances
-  for instance in instances {
-    tx.send(
-      PcoInstancedEvent::from_pieces(
-        event.clone(),
-        instance.clone(),
-        resourse_requests_with_resources.clone(),
-      )
-      .ok_or_eyre("failed to create instanced event from pieces")
-      .map_err(|e| {
-        tracing::error!(
-          "failed to create instanced event from pieces: event = {:?}, \
-           instance = {:?}, resource_requests = {:?}",
-          event.clone(),
-          instance.clone(),
-          resourse_requests_with_resources.clone()
-        );
-        e
-      })?,
-    )
-    .await?;
-  }
-
-  Ok::<(), Report>(())
-}
-
-pub async fn fetch_all_instanced_events() -> Result<Vec<PcoInstancedEvent>> {
-  let secrets = crate::secrets::Secrets::new()?;
-  let client = self::client::PcoClient::new(secrets);
-
-  tracing::info!("fetching events...");
-  let events = client.fetch_all_events().await?;
-  // let events = events.split_off(events.len() - 100);
-  tracing::info!("found {} events", events.len());
-
-  let client = Arc::new(client);
-  let (tx, mut rx) = mpsc::channel::<PcoInstancedEvent>(100);
-
-  tokio::spawn({
-    async move {
-      tracing::info!("fetching event instances and resource requests...");
-      for event in events {
-        tokio::spawn({
-          let (client, tx) = (client.clone(), tx.clone());
-          async move {
-            // fetch the instances
-            let instances =
-              client.fetch_instances(&event.id).await?.into_data_vec()?;
-
-            if instances.is_empty() {
-              return Ok::<(), Report>(());
-            }
-
-            handle_event_with_instances(client, tx, event, instances)
-              .await
-              .map_err(|e| {
-                tracing::error!("failed to handle event: {e:?}");
-                e
-              })
-          }
-        });
+  let stream = event_instance_stream
+    // map event instances to their event IDs
+    .map_ok(|ei| {
+      let event_id = ei
+        .relationships
+        .as_ref()
+        .and_then(|r| r.get("event"))
+        .and_then(|er| er.get("data"))
+        .and_then(|erd| erd.get("id"))
+        .and_then(|id| id.as_str())
+        .map(|id| id.to_string());
+      if event_id.is_none() {
+        tracing::warn!("failed to find event ID for event instance: {}", ei.id);
       }
-    }
-  });
+      event_id
+    })
+    // filter out event instances without event IDs
+    .try_filter_map(|v| futures::future::ready(Ok(v)))
+    // use a hashset with scan to deduplicate event IDs
+    .scan(std::collections::HashSet::new(), |set, v| match v {
+      Ok(v) => {
+        if set.contains(&v) {
+          ready(Some(Ok(None)))
+        } else {
+          set.insert(v.clone());
+          ready(Some(Ok(Some(v))))
+        }
+      }
+      Err(e) => ready(Some(Err(e))),
+    })
+    // filter out the deduplicated values
+    .try_filter_map(|v| ready(Ok(v)))
+    // fetch the event for each event ID
+    // ---
+    // the client is cloned twice because we need it later, and the async block
+    // needs to own the client, but the closure is FnMut so it can't give away
+    //ownership.
+    .and_then({
+      let client = client.clone();
+      move |id| {
+        let client = client.clone();
+        async move { client.fetch_event(id).await }
+      }
+    })
+    // fetch the resource requests for each event
+    .map_ok(move |event| {
+      let client = client.clone();
+      async move {
+        let resource_requests = client
+          .fetch_resource_requests_for_event(event.id.clone())
+          .await?;
+        // fetch the resources for each resource request
+        let resources = futures::stream::iter(resource_requests)
+          .map(|rr| {
+            let resource_id = rr
+              .relationships
+              .as_ref()
+              .and_then(|r| r.get("resource"))
+              .and_then(|rr| rr.get("data"))
+              .and_then(|d| d.get("id"))
+              .and_then(|id| id.as_str())
+              .map(|id| id.to_string());
+            if resource_id.is_none() {
+              tracing::warn!(
+                "failed to find resource ID for resource request: {}",
+                rr.id
+              );
+            }
+            resource_id
+          })
+          .filter_map(futures::future::ready)
+          .map(move |id| {
+            let client = client.clone();
+            async move { client.fetch_resource(id).await }
+          })
+          .buffer_unordered(PCO_CONCURRENCY)
+          .try_collect::<Vec<PcoObject>>()
+          .await?;
+        Ok(PcoEventWithRequestedResources {
+          event,
+          requested_resources: resources,
+        })
+      }
+    })
+    .try_buffer_unordered(PCO_CONCURRENCY);
 
-  let mut instanced_events = Vec::new();
-  while let Some(ie) = rx.recv().await {
-    instanced_events.push(ie);
-    if !instanced_events.is_empty() && instanced_events.len() % 50 == 0 {
-      tracing::info!("found {} instanced events...", instanced_events.len());
-    }
-  }
-  tracing::info!("found {} total instanced events", instanced_events.len());
+  // .map_ok(move |id| {
+  //   let client = client.clone();
+  //   async move { client.fetch_event(id).await }
+  // })
+  // // buffer the requests
+  // .try_buffered(PCO_CONCURRENCY);
 
-  Ok(instanced_events)
+  Box::pin(stream) as BoxStream<_>
 }
