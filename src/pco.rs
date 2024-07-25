@@ -4,10 +4,7 @@ use std::{ops::Deref, sync::Arc};
 
 use color_eyre::eyre::{OptionExt, Report, Result};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{
-  mpsc::{self, Sender},
-  Semaphore,
-};
+use tokio::sync::mpsc::{self, Sender};
 
 use self::client::{PcoClient, PcoObject};
 use crate::DateTimeUtc;
@@ -164,7 +161,6 @@ impl PcoResourceRequest {
 
 async fn handle_event_with_instances(
   progress: Arc<indicatif::ProgressBar>,
-  semaphore: Arc<Semaphore>,
   client: Arc<PcoClient>,
   tx: Sender<PcoInstancedEvent>,
   event: PcoObject,
@@ -208,12 +204,10 @@ async fn handle_event_with_instances(
   }
 
   progress.inc(1);
-  let permit = semaphore.acquire().await.unwrap();
   let resource_requests = client
     .fetch_event_resource_requests(&event.id)
     .await?
     .into_data_vec()?;
-  drop(permit);
 
   let mut resourse_requests_with_resources = Vec::new();
   progress.inc_length(resource_requests.len() as _);
@@ -270,7 +264,6 @@ pub async fn fetch_all_instanced_events() -> Result<Vec<PcoInstancedEvent>> {
 
   let progress = Arc::new(indicatif::ProgressBar::hidden());
   progress.inc_length(events.len() as _);
-  let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
   let client = Arc::new(client);
   let (tx, mut rx) = mpsc::channel::<PcoInstancedEvent>(100);
 
@@ -280,32 +273,24 @@ pub async fn fetch_all_instanced_events() -> Result<Vec<PcoInstancedEvent>> {
       tracing::info!("fetching event instances and resource requests...");
       for event in events {
         tokio::spawn({
-          let (progress, semaphore, client, tx) = (
-            progress.clone(),
-            semaphore.clone(),
-            client.clone(),
-            tx.clone(),
-          );
+          let (progress, client, tx) =
+            (progress.clone(), client.clone(), tx.clone());
           async move {
             // fetch the instances
-            let permit = semaphore.acquire().await.unwrap();
             let instances =
               client.fetch_instances(&event.id).await?.into_data_vec()?;
-            drop(permit);
             progress.inc(1);
 
             if instances.is_empty() {
               return Ok::<(), Report>(());
             }
 
-            handle_event_with_instances(
-              progress, semaphore, client, tx, event, instances,
-            )
-            .await
-            .map_err(|e| {
-              tracing::error!("failed to handle event: {e:?}");
-              e
-            })
+            handle_event_with_instances(progress, client, tx, event, instances)
+              .await
+              .map_err(|e| {
+                tracing::error!("failed to handle event: {e:?}");
+                e
+              })
           }
         });
       }

@@ -1,6 +1,5 @@
 use std::fmt::Debug;
 
-use chrono::Datelike;
 use color_eyre::{
   eyre::{Result, WrapErr},
   Section, SectionExt,
@@ -240,7 +239,7 @@ impl AsanaTask {
     // `>>>>> [event_id] <<<<<`
     let start = code_element.find(">>>>>")? + 6;
     let end = code_element.find("<<<<<")?;
-    let ids: Vec<&str> = code_element[start..end].trim().split(":").collect();
+    let ids: Vec<&str> = code_element[start..end].trim().split(':').collect();
 
     // make sure we've got both IDs
     if ids.len() != 2 {
