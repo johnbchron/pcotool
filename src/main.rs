@@ -80,23 +80,16 @@ async fn main() -> Result<()> {
 
   tracing::info!("creating tasks...");
   let asana_client = Arc::new(asana_client);
-  let semaphore = Arc::new(tokio::sync::Semaphore::new(5));
 
   let mut jhs = Vec::new();
   for ie in tasks_to_create {
     jhs.push(tokio::spawn({
       let asana_client = asana_client.clone();
-      let semaphore = semaphore.clone();
       async move {
-        let permit = semaphore
-          .acquire_owned()
-          .await
-          .wrap_err("failed to acquire semaphore")?;
         asana_client
           .create_task(ie)
           .await
           .wrap_err("failed to create task")?;
-        drop(permit);
         Ok::<(), Error>(())
       }
     }));

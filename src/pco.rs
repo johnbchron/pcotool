@@ -144,7 +144,7 @@ impl PcoResourceRequest {
     let resource = client
       .fetch_resource(&self.resource_id)
       .await?
-      .to_single()?;
+      .into_single()?;
     let resource_name = resource
       .attributes
       .as_ref()
@@ -212,7 +212,7 @@ async fn handle_event_with_instances(
   let resource_requests = client
     .fetch_event_resource_requests(&event.id)
     .await?
-    .to_data_vec()?;
+    .into_data_vec()?;
   drop(permit);
 
   let mut resourse_requests_with_resources = Vec::new();
@@ -290,7 +290,7 @@ pub async fn fetch_all_instanced_events() -> Result<Vec<PcoInstancedEvent>> {
             // fetch the instances
             let permit = semaphore.acquire().await.unwrap();
             let instances =
-              client.fetch_instances(&event.id).await?.to_data_vec()?;
+              client.fetch_instances(&event.id).await?.into_data_vec()?;
             drop(permit);
             progress.inc(1);
 

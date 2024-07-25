@@ -5,17 +5,18 @@ use color_eyre::{
   Section, SectionExt,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tracing::instrument;
 
 use crate::secrets::Secrets;
 
-const URL_PREFIX: &'static str =
-  "https://api.planningcenteronline.com/calendar/v2";
+const URL_PREFIX: &str = "https://api.planningcenteronline.com/calendar/v2";
 
 #[derive(Clone)]
 pub struct PcoClient {
-  client:  reqwest::Client,
-  secrets: Secrets,
+  client:    reqwest::Client,
+  secrets:   Secrets,
+  semaphore: Arc<Semaphore>,
 }
 
 impl PcoClient {
@@ -23,10 +24,16 @@ impl PcoClient {
     Self {
       client: reqwest::Client::new(),
       secrets,
+      semaphore: Arc::new(Semaphore::new(5)),
     }
   }
 
   async fn fetch(&self, url: &str, mut retries: u8) -> Result<PcoResponse> {
+    let _lock = self
+      .semaphore
+      .acquire()
+      .await
+      .wrap_err("failed to acquire semaphore")?;
     loop {
       if retries == 0 {
         tracing::debug!("fetching");
@@ -56,24 +63,19 @@ impl PcoClient {
         .with_section(|| text_resp.header("Original Response:"))?;
 
       // handle 429 and retries
-      match json_resp {
-        PcoResponse::Error { ref errors } => {
-          if errors.first().map(|e| e.code.as_str()) == Some("429") {
-            if retries < 10 {
-              tokio::time::sleep(Duration::from_secs(10)).await;
-              retries = retries + 1;
-              continue;
-            } else {
-              tracing::error!("exceeded max retry count (10), aborting");
-              return Err(color_eyre::eyre::eyre!(
-                "exceeded max request retry count"
-              ));
-            }
+      if let PcoResponse::Error { ref errors } = json_resp {
+        if errors.first().map(|e| e.code.as_str()) == Some("429") {
+          if retries < 10 {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            retries += 1;
+            continue;
+          } else {
+            tracing::error!("exceeded max retry count (10), aborting");
+            return Err(color_eyre::eyre::eyre!(
+              "exceeded max request retry count"
+            ));
           }
         }
-        // not handling the other cases because they're happy paths, and we'll
-        //   just return them
-        _ => (),
       }
 
       return Ok(json_resp);
@@ -123,7 +125,7 @@ impl PcoClient {
         .await
         .wrap_err("failed to join task")?
         .wrap_err("task failed")?;
-      events.extend(response.to_data_vec()?);
+      events.extend(response.into_data_vec()?);
     }
     Ok(events)
   }
@@ -193,7 +195,7 @@ pub enum PcoResponse {
 }
 
 impl PcoResponse {
-  pub fn to_data_vec(self) -> Result<Vec<PcoObject>> {
+  pub fn into_data_vec(self) -> Result<Vec<PcoObject>> {
     match self {
       PcoResponse::Single { data } => Ok(vec![data]),
       PcoResponse::Multiple { data, .. } => Ok(data),
@@ -206,7 +208,7 @@ impl PcoResponse {
       }
     }
   }
-  pub fn to_single(self) -> Result<PcoObject> {
+  pub fn into_single(self) -> Result<PcoObject> {
     match self {
       PcoResponse::Single { data } => Ok(data),
       PcoResponse::Multiple { .. } => {
@@ -214,7 +216,7 @@ impl PcoResponse {
       }
       PcoResponse::Error { errors } => {
         let mut error = color_eyre::eyre::eyre!("asana error");
-        for err in vec![errors] {
+        for err in errors {
           error = error.section(format!("{:#?}", err));
         }
         Err(error)
