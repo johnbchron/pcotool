@@ -8,7 +8,6 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.9.0"
 color-eyre = "0.6"
 futures = "0.3.30"
-indicatif = "0.17.8"
 reqwest = { version = "0.12", default-features = false, features = [ "http2", "json", "rustls-tls" ] }
 scraper = "0.19"
 serde = { version = "1", features = ["derive"] }

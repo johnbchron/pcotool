@@ -160,7 +160,6 @@ impl PcoResourceRequest {
 }
 
 async fn handle_event_with_instances(
-  progress: Arc<indicatif::ProgressBar>,
   client: Arc<PcoClient>,
   tx: Sender<PcoInstancedEvent>,
   event: PcoObject,
@@ -203,14 +202,12 @@ async fn handle_event_with_instances(
     );
   }
 
-  progress.inc(1);
   let resource_requests = client
     .fetch_event_resource_requests(&event.id)
     .await?
     .into_data_vec()?;
 
   let mut resourse_requests_with_resources = Vec::new();
-  progress.inc_length(resource_requests.len() as _);
   for resource_request in resource_requests {
     let resource_request_with_resource =
       PcoResourceRequest::from_object(resource_request)
@@ -222,11 +219,9 @@ async fn handle_event_with_instances(
           e
         })?;
     resourse_requests_with_resources.push(resource_request_with_resource);
-    progress.inc(1);
   }
 
   // iterate through the instances
-  progress.inc_length(instances.len() as _);
   for instance in instances {
     tx.send(
       PcoInstancedEvent::from_pieces(
@@ -247,7 +242,6 @@ async fn handle_event_with_instances(
       })?,
     )
     .await?;
-    progress.inc(1);
   }
 
   Ok::<(), Report>(())
@@ -262,30 +256,25 @@ pub async fn fetch_all_instanced_events() -> Result<Vec<PcoInstancedEvent>> {
   // let events = events.split_off(events.len() - 100);
   tracing::info!("found {} events", events.len());
 
-  let progress = Arc::new(indicatif::ProgressBar::hidden());
-  progress.inc_length(events.len() as _);
   let client = Arc::new(client);
   let (tx, mut rx) = mpsc::channel::<PcoInstancedEvent>(100);
 
   tokio::spawn({
-    let progress = progress.clone();
     async move {
       tracing::info!("fetching event instances and resource requests...");
       for event in events {
         tokio::spawn({
-          let (progress, client, tx) =
-            (progress.clone(), client.clone(), tx.clone());
+          let (client, tx) = (client.clone(), tx.clone());
           async move {
             // fetch the instances
             let instances =
               client.fetch_instances(&event.id).await?.into_data_vec()?;
-            progress.inc(1);
 
             if instances.is_empty() {
               return Ok::<(), Report>(());
             }
 
-            handle_event_with_instances(progress, client, tx, event, instances)
+            handle_event_with_instances(client, tx, event, instances)
               .await
               .map_err(|e| {
                 tracing::error!("failed to handle event: {e:?}");
@@ -305,7 +294,6 @@ pub async fn fetch_all_instanced_events() -> Result<Vec<PcoInstancedEvent>> {
     }
   }
   tracing::info!("found {} total instanced events", instanced_events.len());
-  progress.finish();
 
   Ok(instanced_events)
 }
