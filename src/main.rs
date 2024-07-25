@@ -26,8 +26,6 @@ fn setup_tracing() {
     .with(fmt_layer)
     .with(ErrorLayer::default())
     .init();
-
-  // console_subscriber::init();
 }
 
 #[tokio::main]
@@ -36,16 +34,16 @@ async fn main() -> Result<()> {
   setup_tracing();
   color_eyre::install()?;
 
-  // let instanced_events = self::pco::fetch_all_instanced_events().await?;
-  // std::fs::write(
-  //   "instanced_events.json",
-  //   serde_json::to_string(&instanced_events).unwrap(),
-  // )
-  // .unwrap();
+  let instanced_events = self::pco::fetch_all_instanced_events().await?;
+  std::fs::write(
+    "instanced_events.json",
+    serde_json::to_string(&instanced_events).unwrap(),
+  )
+  .unwrap();
 
-  let json_data: Vec<u8> = std::fs::read("instanced_events.json").unwrap();
-  let instanced_events: Vec<PcoInstancedEvent> =
-    serde_json::from_slice(&json_data).unwrap();
+  // let json_data: Vec<u8> = std::fs::read("instanced_events.json").unwrap();
+  // let instanced_events: Vec<PcoInstancedEvent> =
+  //   serde_json::from_slice(&json_data).unwrap();
 
   let asana_client = crate::asana::AsanaClient::new(Secrets::new()?);
   let tasks = asana_client

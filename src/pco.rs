@@ -30,6 +30,15 @@ impl PcoInstancedEvent {
     instance: PcoObject,
     resource_requests: Vec<PcoResourceRequestWithResource>,
   ) -> Option<Self> {
+    tracing::info!(
+      "event_instance recurrence_description: `{}`",
+      instance
+        .attributes
+        .as_ref()
+        .and_then(|h| h.get("recurrence_description"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("none")
+    );
     Some(Self {
       event_id: event.id,
       event_name: event
@@ -179,9 +188,9 @@ async fn handle_event_with_instances(
         )
         .unwrap(),
       );
-      instance_starts_at + chrono::Duration::days(7) > chrono::Utc::now()
+      instance_starts_at > chrono::Utc::now()
         && instance_starts_at - chrono::Duration::days(7 * 6)
-          > chrono::Utc::now()
+          < chrono::Utc::now()
     })
     .collect::<Vec<_>>();
 
@@ -306,7 +315,7 @@ pub async fn fetch_all_instanced_events() -> Result<Vec<PcoInstancedEvent>> {
   let mut instanced_events = Vec::new();
   while let Some(ie) = rx.recv().await {
     instanced_events.push(ie);
-    if instanced_events.len() > 0 && instanced_events.len() % 50 == 0 {
+    if !instanced_events.is_empty() && instanced_events.len() % 50 == 0 {
       tracing::info!("found {} instanced events...", instanced_events.len());
     }
   }
