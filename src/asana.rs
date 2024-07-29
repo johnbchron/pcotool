@@ -1,13 +1,31 @@
-use std::fmt::Debug;
+use std::{collections::HashMap, fmt::Debug};
 
 use color_eyre::{
   eyre::{Result, WrapErr},
-  Section,
+  Section, SectionExt,
 };
+use phf::phf_map;
+use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use crate::secrets::Secrets;
+use crate::{pco::PcoEventWithRequestedResources, secrets::Secrets};
+
+const TASK_OPT_FIELDS: &str = "name,html_notes,tags,tags.name";
+
+static TRACKED_RESOURCES: phf::Map<&'static str, &'static str> = phf_map! {
+  "ATS Room" => "ATS",
+  "Main Auditorium" => "MA",
+  "Main Lobby" => "Lobby",
+  "Room 400" => "KA",
+  "Room 500" => "500",
+  "Room 500 AV" => "500",
+  "Sound Box - Small #1" => "Portable",
+  "Sound Box - Large #1" => "Portable",
+  "Sound System - Small" => "Portable",
+  "Sound System - Large" => "Portable",
+  "Underground Auditorium" => "UA",
+};
 
 /// The error type returned by the Asana API.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -52,7 +70,7 @@ fn error_from_asana_errors(
 
 impl<T> AsanaResponse<T>
 where
-  T: Debug,
+  T: Debug + for<'a> serde::Deserialize<'a>,
 {
   /// Convert the response into a [`color_eyre`] result.
   pub fn into_result(self) -> Result<T> {
@@ -61,12 +79,26 @@ where
       AsanaResponse::Error { errors } => Err(error_from_asana_errors(errors)),
     }
   }
+
+  /// Decode a response as an Asana response.
+  pub async fn decode_response(input: Response) -> Result<Self> {
+    let text_resp = input
+      .text()
+      .await
+      .wrap_err("failed to decode response as utf-8 plaintext")?;
+    let resp = serde_json::from_str::<AsanaResponse<T>>(&text_resp)
+      .wrap_err("failed to parse response")
+      .with_section(|| text_resp.header("Original Response:"))?;
+    Ok(resp)
+  }
 }
 
 /// A client for interacting with the Asana API.
 pub struct AsanaClient {
-  client:  reqwest::Client,
-  secrets: Secrets,
+  client:    reqwest::Client,
+  secrets:   Secrets,
+  semaphore: tokio::sync::Semaphore,
+  tag_cache: tokio::sync::Mutex<Option<HashMap<String, AsanaTag>>>,
 }
 
 impl AsanaClient {
@@ -75,30 +107,9 @@ impl AsanaClient {
     Self {
       client: reqwest::Client::new(),
       secrets,
+      semaphore: tokio::sync::Semaphore::new(5),
+      tag_cache: tokio::sync::Mutex::new(None),
     }
-  }
-
-  /// Fetch a task from the Asana API.
-  #[instrument(skip(self))]
-  pub async fn get_task(&self, task_gid: u64) -> Result<AsanaTask> {
-    let url = format!("https://app.asana.com/api/1.0/tasks/{task_gid}");
-
-    let resp = self
-      .client
-      .get(&url)
-      .bearer_auth(&self.secrets.asana_pat)
-      .query(&[("opt_fields", "name,html_notes")])
-      .send()
-      .await
-      .wrap_err("failed to fetch")?;
-
-    let resp = resp
-      .json::<AsanaResponse<AsanaTask>>()
-      .await
-      .wrap_err("failed to parse")?
-      .into_result()?;
-
-    Ok(resp)
   }
 
   /// Fetch tasks in the PCOTool project from the Asana API.
@@ -116,20 +127,20 @@ impl AsanaClient {
       .client
       .get(&url)
       .bearer_auth(&self.secrets.asana_pat)
-      .query(&[("opt_fields", "name,html_notes"), ("limit", "25")]);
+      .query(&[("opt_fields", TASK_OPT_FIELDS), ("limit", "25")]);
     if let Some(offset) = offset {
       req = req.query(&[("offset", offset)])
     }
 
-    let resp = req
-      .send()
+    let permit = self
+      .semaphore
+      .acquire()
       .await
-      .wrap_err("failed to fetch")?
-      .json::<AsanaResponse<Vec<AsanaTask>>>()
-      .await
-      .wrap_err("failed to parse")?;
+      .wrap_err("failed to acquire semaphore")?;
+    let resp = req.send().await.wrap_err("failed to fetch")?;
+    drop(permit);
 
-    Ok(resp)
+    AsanaResponse::decode_response(resp).await
   }
 
   /// Fetch all tasks in the PCOTool project from the Asana API.
@@ -157,60 +168,168 @@ impl AsanaClient {
     Ok(results)
   }
 
-  // /// Create an Asana task from a [`PcoInstancedEvent`].
-  // #[instrument(skip(self))]
-  // pub async fn create_task(
-  //   &self,
-  //   ie: PcoInstancedEvent,
-  // ) -> Result<AsanaResponse<AsanaTask>> {
-  //   let url = "https://app.asana.com/api/1.0/tasks";
+  /// Create an Asana task from a [`PcoInstancedEvent`].
+  #[instrument(skip(self, event))]
+  pub async fn create_task(
+    &self,
+    event: PcoEventWithRequestedResources,
+  ) -> Result<AsanaTask> {
+    let url = "https://app.asana.com/api/1.0/tasks";
 
-  //   let local_starts_at =
-  //     ie.starts_at.with_timezone(&chrono_tz::America::Chicago);
-  //   let name = format!(
-  //     "{} - {}",
-  //     ie.event_name.trim(),
-  //     local_starts_at.format("%m-%d-%Y")
-  //   );
-  //   let html_notes = format!(
-  //     "<body>\n<code>&gt;&gt;&gt;&gt;&gt; {event_id}:{instance_id} \
-  //      &lt;&lt;&lt;&lt;&lt;</code></body>",
-  //     event_id = ie.event_id,
-  //     instance_id = ie.instance_id
-  //   );
+    let name = event.event.get_attribute("name").unwrap_or_else(|| {
+      tracing::warn!("failed to find event name for event: {}", event.event.id);
+      format!("Unknown Asana Event: {}", event.event.id)
+    });
 
-  //   let request_payload = serde_json::json!({
-  //     "data": {
-  //       "projects": [
-  //         self.secrets.asana_project_gid.to_string()
-  //       ],
-  //       "name": name,
-  //       "due_at": ie.starts_at.to_rfc3339(),
-  //       "html_notes": html_notes,
-  //     },
-  //   });
+    let html_notes = format!(
+      "<body>\n<code>&gt;&gt;&gt;&gt; {} &lt;&lt;&lt;&lt;</code></body>",
+      event.event.id,
+    );
 
-  //   let req = self
-  //     .client
-  //     .post(url)
-  //     .query(&[("opt_fields", "name,html_notes")])
-  //     .bearer_auth(&self.secrets.asana_pat)
-  //     .json(&request_payload);
+    let resource_names = event
+      .requested_resources
+      .iter()
+      .filter_map(|r| {
+        let name = r.get_attribute("name");
+        if name.is_none() {
+          tracing::warn!("failed to find resource name for resource: {}", r.id);
+        }
+        name
+      })
+      .filter_map(|name| TRACKED_RESOURCES.get(name.as_str()))
+      .map(|v| v.to_string())
+      .collect::<Vec<String>>();
+    let mut tags = vec![];
+    for resource in resource_names {
+      let tag = self.find_tag_by_name(&resource).await?;
+      if let Some(tag) = tag {
+        tags.push(tag.gid);
+      } else {
+        tracing::warn!("failed to find tag for resource: {}", resource);
+      }
+    }
 
-  //   let resp = req.send().await.wrap_err("failed to fetch")?;
+    let request_payload = serde_json::json!({
+      "data": {
+        "html_notes": html_notes,
+        "name": name,
+        "projects": [
+          self.secrets.asana_project_gid.to_string()
+        ],
+        "tags": tags,
+      },
+    });
 
-  //   // deserialize to PcoResponse
-  //   let text_resp = resp
-  //     .text()
-  //     .await
-  //     .wrap_err("failed to decode asana response as utf-8 plaintext")?;
-  //   let json_resp =
-  //     serde_json::from_str::<AsanaResponse<AsanaTask>>(&text_resp)
-  //       .wrap_err("failed to parse asana json response")
-  //       .with_section(|| text_resp.header("Original Response:"))?;
+    let req = self
+      .client
+      .post(url)
+      .query(&[("opt_fields", TASK_OPT_FIELDS)])
+      .bearer_auth(&self.secrets.asana_pat)
+      .json(&request_payload);
 
-  //   Ok(json_resp)
-  // }
+    let permit = self
+      .semaphore
+      .acquire()
+      .await
+      .wrap_err("failed to acquire semaphore")?;
+    let resp = req.send().await.wrap_err("failed to fetch")?;
+    drop(permit);
+
+    AsanaResponse::decode_response(resp).await?.into_result()
+  }
+
+  /// Fetch tags from the Asana API.
+  #[instrument(skip(self))]
+  async fn get_tags(
+    &self,
+    offset: Option<&str>,
+  ) -> Result<AsanaResponse<Vec<AsanaTag>>> {
+    let url = "https://app.asana.com/api/1.0/tags";
+
+    let mut req = self
+      .client
+      .get(url)
+      .bearer_auth(&self.secrets.asana_pat)
+      .query(&[
+        ("limit", "100"),
+        ("workspace", &self.secrets.asana_workspace_gid.to_string()),
+      ]);
+    if let Some(offset) = offset {
+      req = req.query(&[("offset", offset)])
+    }
+
+    let permit = self
+      .semaphore
+      .acquire()
+      .await
+      .wrap_err("failed to acquire semaphore")?;
+    let resp = req.send().await.wrap_err("failed to fetch")?;
+    drop(permit);
+
+    AsanaResponse::decode_response(resp).await
+  }
+
+  #[instrument(skip(self))]
+  async fn get_all_tags(&self) -> Result<Vec<AsanaTag>> {
+    let mut resp = self.get_tags(None).await?;
+    let mut results: Vec<AsanaTag> = vec![];
+
+    loop {
+      let (mut data, next_page) = match resp {
+        AsanaResponse::Success { data, next_page } => (data, next_page),
+        AsanaResponse::Error { errors } => {
+          return Err(error_from_asana_errors(errors));
+        }
+      };
+
+      results.append(&mut data);
+      let Some(next_page) = next_page else {
+        break;
+      };
+
+      resp = self.get_tags(Some(&next_page.offset)).await?;
+    }
+
+    let mut tag_cache = self.tag_cache.lock().await;
+    match *tag_cache {
+      Some(ref mut cache) => {
+        for tag in &results {
+          cache.insert(tag.gid.clone(), tag.clone());
+        }
+      }
+      None => {
+        let mut cache = HashMap::new();
+        for tag in &results {
+          cache.insert(tag.gid.clone(), tag.clone());
+        }
+        *tag_cache = Some(cache);
+      }
+    }
+
+    Ok(results)
+  }
+
+  /// Find a tag by name.
+  #[instrument(skip(self))]
+  pub async fn find_tag_by_name(&self, name: &str) -> Result<Option<AsanaTag>> {
+    // look in the cache or fetch all tags and look in the cache
+    let tag_cache = self.tag_cache.lock().await;
+
+    let tag_cache = match *tag_cache {
+      Some(ref cache) => cache.clone(),
+      None => {
+        drop(tag_cache);
+        let _ = self.get_all_tags().await?;
+        self.tag_cache.lock().await.clone().unwrap()
+      }
+    };
+
+    let mut tags = tag_cache.values().collect::<Vec<&AsanaTag>>();
+    tags.sort_by(|a, b| a.gid.cmp(&b.gid));
+    let tag = tags.into_iter().find(|tag| tag.name == name).cloned();
+
+    Ok(tag)
+  }
 }
 
 /// A task from the Asana API.
@@ -219,6 +338,14 @@ pub struct AsanaTask {
   pub gid:        String,
   pub name:       String,
   pub html_notes: String,
+  pub tags:       Vec<AsanaTag>,
+}
+
+/// A tag from the Asana API.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AsanaTag {
+  pub gid:  String,
+  pub name: String,
 }
 
 impl AsanaTask {
@@ -236,36 +363,42 @@ impl AsanaTask {
       .collect::<String>();
 
     // extract the event id with the following format:
-    // `>>>>> [event_id] <<<<<`
-    let start = code_element.find(">>>>>")? + 6;
-    let end = code_element.find("<<<<<")?;
-    let ids: Vec<&str> = code_element[start..end].trim().split(':').collect();
+    // `>>>> [event_id] <<<<`
+    let start = code_element.find(">>>>").or_else(|| {
+      tracing::warn!(
+        "failed to extract event ID from task HTML notes: couldn't find start \
+         marker"
+      );
+      None
+    })?;
+    let start = start + 4;
+    let end = code_element.find("<<<<").or_else(|| {
+      tracing::warn!(
+        "failed to extract event ID from task HTML notes: couldn't find end \
+         marker"
+      );
+      None
+    })?;
+    let id = &code_element[start..end].trim();
 
-    // make sure we've got both IDs
-    if ids.len() != 2 {
-      return None;
-    }
-    if ids[0].is_empty() || ids[1].is_empty() {
+    if id.is_empty() {
+      tracing::warn!(
+        "failed to extract event ID from task HTML notes: extracted ID is \
+         empty"
+      );
       return None;
     }
 
     Some(AsanaLinkedTask {
-      task:        self,
-      event_id:    ids[0].to_string(),
-      instance_id: ids[1].to_string(),
+      task:     self,
+      event_id: id.to_string(),
     })
-  }
-
-  /// Convert the task into a linked task.
-  pub fn as_linked_task(&self) -> Option<AsanaLinkedTask> {
-    self.clone().into_linked_task()
   }
 }
 
 /// A task from the Asana API that has been linked to a PCO event.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AsanaLinkedTask {
-  pub task:        AsanaTask,
-  pub event_id:    String,
-  pub instance_id: String,
+  pub task:     AsanaTask,
+  pub event_id: String,
 }

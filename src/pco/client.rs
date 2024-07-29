@@ -267,3 +267,9 @@ pub struct PcoObject {
   #[serde(default)]
   pub links:         Option<HashMap<String, Option<String>>>,
 }
+
+impl PcoObject {
+  pub fn get_attribute(&self, key: &str) -> Option<String> {
+    Some(self.attributes.as_ref()?.get(key)?.as_str()?.to_string())
+  }
+}

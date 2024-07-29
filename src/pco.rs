@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use self::client::{PcoClient, PcoObject};
 
-pub const PCO_CONCURRENCY: usize = 4;
+pub const PCO_CONCURRENCY: usize = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PcoEventWithRequestedResources {
