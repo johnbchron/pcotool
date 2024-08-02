@@ -14,18 +14,55 @@ use crate::{pco::PcoEventWithRequestedResources, secrets::Secrets};
 const TASK_OPT_FIELDS: &str = "name,html_notes,tags,tags.name";
 
 static TRACKED_RESOURCES: phf::Map<&'static str, &'static str> = phf_map! {
-  "ATS Room" => "ATS",
+  "CONNECT" => "Connect",
+  "Kids Auditorium" => "KA",
+  "Kids Lobby" => "KA Lobby",
   "Main Auditorium" => "MA",
-  "Main Lobby" => "Lobby",
-  "Room 400" => "KA",
+  "Main Lobby" => "MA Lobby",
+  "Room 400" => "400",
   "Room 500" => "500",
-  "Room 500 AV" => "500",
-  "Sound Box - Small #1" => "Portable",
-  "Sound Box - Large #1" => "Portable",
-  "Sound System - Small" => "Portable",
-  "Sound System - Large" => "Portable",
+  "Second Floor Classroom" => "2nd Floor",
+
+  "ATS Room" => "ATS",
   "Underground Auditorium" => "UA",
+
+  "Digital Recorder" => "Portable",
+  "Graphics Computer" => "Portable",
+  "Lighting System" => "Portable",
+  "Livestream Encoder" => "Portable",
+  "Portable Battery" => "Portable",
+  "Powerpoint Clicker" => "Portable",
+  "Proj. Screen - Large" => "Portable",
+  "Proj. Screen - Medium" => "Portable",
+  "Projector - Large" => "Portable",
+  "Projector - Medium" => "Portable",
+  "Projector Accessories" => "Portable",
+  "Projector Stand" => "Portable",
+  "Sound Box - Large #1" => "Portable",
+  "Sound Box - Large #2" => "Portable",
+  "Sound Box - Large #3" => "Portable",
+  "Sound Box - Small #1" => "Soundbox",
+  "Sound Box - Small #2" => "Soundbox",
+  "Sound Box - Small #3" => "Soundbox",
+  "Sound System - Large" => "Portable",
+  "Sound System - Medium" => "Portable",
+  "Stage squares" => "Portable",
+  "Translation Equip" => "Portable",
+  "Video Camera" => "Portable",
 };
+
+const SUBTASK_LIST: &[&str] = &[
+  "PCO Info",
+  "Pre-Production Email",
+  "Concept Meeting",
+  "Final Meeting",
+  "Train/Schedule Tech",
+  "Setup Streaming",
+  "Equipment List",
+  "Equipment Check Out",
+  "Equipment Check In",
+  "Follow Up",
+];
 
 /// The error type returned by the Asana API.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -107,7 +144,7 @@ impl AsanaClient {
     Self {
       client: reqwest::Client::new(),
       secrets,
-      semaphore: tokio::sync::Semaphore::new(5),
+      semaphore: tokio::sync::Semaphore::new(10),
       tag_cache: tokio::sync::Mutex::new(None),
     }
   }
@@ -169,11 +206,11 @@ impl AsanaClient {
   }
 
   /// Create an Asana task from a [`PcoInstancedEvent`].
-  #[instrument(skip(self, event))]
+  #[instrument(skip(self, event), fields(event_id = event.event.id, task_gid))]
   pub async fn create_task(
     &self,
     event: PcoEventWithRequestedResources,
-  ) -> Result<AsanaTask> {
+  ) -> Result<Option<AsanaTask>> {
     let url = "https://app.asana.com/api/1.0/tasks";
 
     let name = event.event.get_attribute("name").unwrap_or_else(|| {
@@ -209,6 +246,23 @@ impl AsanaClient {
       }
     }
 
+    if tags.is_empty() {
+      tracing::warn!(
+        "no tracked resources, discarding event: {}",
+        event.event.id
+      );
+      return Ok(None);
+    }
+
+    tags.sort_unstable();
+
+    let created_tag = self.find_tag_by_name("New").await?;
+    if let Some(created_tag) = created_tag {
+      tags.push(created_tag.gid);
+    } else {
+      tracing::warn!("failed to find \"New\" tag");
+    }
+
     let request_payload = serde_json::json!({
       "data": {
         "html_notes": html_notes,
@@ -235,7 +289,60 @@ impl AsanaClient {
     let resp = req.send().await.wrap_err("failed to fetch")?;
     drop(permit);
 
-    AsanaResponse::decode_response(resp).await?.into_result()
+    let task = AsanaResponse::<AsanaTask>::decode_response(resp)
+      .await?
+      .into_result()?;
+    tracing::Span::current().record("task_gid", &task.gid);
+    tracing::info!("created task");
+
+    for subtask_name in SUBTASK_LIST.iter().rev() {
+      self
+        .create_subtask(&task.gid, subtask_name)
+        .await
+        .wrap_err("failed to create subtask")?;
+    }
+
+    Ok(Some(task))
+  }
+
+  #[instrument(skip(self), fields(task_gid))]
+  pub async fn create_subtask(
+    &self,
+    parent_task_gid: &str,
+    name: &str,
+  ) -> Result<AsanaTask> {
+    let url = format!(
+      "https://app.asana.com/api/1.0/tasks/{parent_task_gid}/subtasks",
+    );
+
+    let request_payload = serde_json::json!({
+      "data": {
+        "name": name,
+      },
+    });
+
+    let req = self
+      .client
+      .post(url)
+      .query(&[("opt_fields", TASK_OPT_FIELDS)])
+      .bearer_auth(&self.secrets.asana_pat)
+      .json(&request_payload);
+
+    let permit = self
+      .semaphore
+      .acquire()
+      .await
+      .wrap_err("failed to acquire semaphore")?;
+    let resp = req.send().await.wrap_err("failed to fetch")?;
+    drop(permit);
+
+    let task = AsanaResponse::<AsanaTask>::decode_response(resp)
+      .await?
+      .into_result()?;
+    tracing::Span::current().record("task_gid", &task.gid);
+    tracing::info!("created subtask");
+
+    Ok(task)
   }
 
   /// Fetch tags from the Asana API.
