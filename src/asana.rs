@@ -9,11 +9,11 @@ use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use crate::{pco::PcoEventWithRequestedResources, secrets::Secrets};
+use crate::secrets::Secrets;
 
 const TASK_OPT_FIELDS: &str = "name,html_notes,tags,tags.name";
 
-static TRACKED_RESOURCES: phf::Map<&'static str, &'static str> = phf_map! {
+pub static TRACKED_RESOURCES: phf::Map<&'static str, &'static str> = phf_map! {
   "CONNECT" => "Connect",
   "Kids Auditorium" => "KA",
   "Kids Lobby" => "KA Lobby",
@@ -206,56 +206,23 @@ impl AsanaClient {
   }
 
   /// Create an Asana task from a [`PcoInstancedEvent`].
-  #[instrument(skip(self, event), fields(event_id = event.event.id, task_gid))]
+  #[instrument(skip(self, event), fields(event_id = event.event_id, task_gid))]
   pub async fn create_task(
     &self,
-    event: PcoEventWithRequestedResources,
+    event: crate::CanonTask,
   ) -> Result<Option<AsanaTask>> {
     let url = "https://app.asana.com/api/1.0/tasks";
 
-    let name = event.event.get_attribute("name").unwrap_or_else(|| {
-      tracing::warn!("failed to find event name for event: {}", event.event.id);
-      format!("Unknown Asana Event: {}", event.event.id)
-    });
-
     let html_notes = format!(
       "<body>\n<code>&gt;&gt;&gt;&gt; {} &lt;&lt;&lt;&lt;</code></body>",
-      event.event.id,
+      event.event_id,
     );
 
-    let resource_names = event
-      .requested_resources
-      .iter()
-      .filter_map(|r| {
-        let name = r.get_attribute("name");
-        if name.is_none() {
-          tracing::warn!("failed to find resource name for resource: {}", r.id);
-        }
-        name
-      })
-      .filter_map(|name| TRACKED_RESOURCES.get(name.as_str()))
-      .map(|v| v.to_string())
-      .collect::<Vec<String>>();
-    let mut tags = vec![];
-    for resource in resource_names {
-      let tag = self.find_tag_by_name(&resource).await?;
-      if let Some(tag) = tag {
-        tags.push(tag.gid);
-      } else {
-        tracing::warn!("failed to find tag for resource: {}", resource);
-      }
-    }
-
-    if tags.is_empty() {
-      tracing::warn!(
-        "no tracked resources, discarding event: {}",
-        event.event.id
-      );
-      return Ok(None);
-    }
-
-    tags.sort_unstable();
-
+    let mut tags = event
+      .resource_tags
+      .into_iter()
+      .map(|t| t.gid)
+      .collect::<Vec<_>>();
     let created_tag = self.find_tag_by_name("New").await?;
     if let Some(created_tag) = created_tag {
       tags.push(created_tag.gid);
@@ -266,7 +233,7 @@ impl AsanaClient {
     let request_payload = serde_json::json!({
       "data": {
         "html_notes": html_notes,
-        "name": name,
+        "name": event.name,
         "projects": [
           self.secrets.asana_project_gid.to_string()
         ],

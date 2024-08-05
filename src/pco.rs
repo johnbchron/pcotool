@@ -67,7 +67,7 @@ pub async fn find_relevant_events(
     // ---
     // the client is cloned twice because we need it later, and the async block
     // needs to own the client, but the closure is FnMut so it can't give away
-    //ownership.
+    // ownership.
     .and_then({
       let client = client.clone();
       move |id| {
