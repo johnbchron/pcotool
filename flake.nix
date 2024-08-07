@@ -39,7 +39,7 @@
         });
 
         crontab_file = pkgs.writeText "crontab" ''
-          */1 * * * *  ${pcotool}/bin/pcotool
+          0 6 * * *  ${pcotool}/bin/pcotool
         '';
 
         container = pkgs.dockerTools.buildLayeredImage {
