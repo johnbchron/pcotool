@@ -1,4 +1,7 @@
-use std::{collections::HashMap, fmt::Debug};
+use std::{
+  collections::{HashMap, HashSet},
+  fmt::Debug,
+};
 
 use color_eyre::{
   eyre::{Result, WrapErr},
@@ -9,7 +12,7 @@ use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use crate::secrets::Secrets;
+use crate::{secrets::Secrets, CanonTask};
 
 const TASK_OPT_FIELDS: &str = "name,html_notes,tags,tags.name";
 
@@ -149,6 +152,24 @@ impl AsanaClient {
     }
   }
 
+  async fn send_request<T>(
+    &self,
+    req: reqwest::RequestBuilder,
+  ) -> Result<AsanaResponse<T>>
+  where
+    T: Debug + for<'a> serde::Deserialize<'a>,
+  {
+    let permit = self
+      .semaphore
+      .acquire()
+      .await
+      .wrap_err("failed to acquire semaphore")?;
+    let resp = req.send().await.wrap_err("failed to fetch")?;
+    drop(permit);
+
+    AsanaResponse::decode_response(resp).await
+  }
+
   /// Fetch tasks in the PCOTool project from the Asana API.
   #[instrument(skip(self))]
   async fn get_tasks(
@@ -169,15 +190,7 @@ impl AsanaClient {
       req = req.query(&[("offset", offset)])
     }
 
-    let permit = self
-      .semaphore
-      .acquire()
-      .await
-      .wrap_err("failed to acquire semaphore")?;
-    let resp = req.send().await.wrap_err("failed to fetch")?;
-    drop(permit);
-
-    AsanaResponse::decode_response(resp).await
+    self.send_request(req).await
   }
 
   /// Fetch all tasks in the PCOTool project from the Asana API.
@@ -214,8 +227,9 @@ impl AsanaClient {
     let url = "https://app.asana.com/api/1.0/tasks";
 
     let html_notes = format!(
-      "<body>\n<code>&gt;&gt;&gt;&gt; {} &lt;&lt;&lt;&lt;</code></body>",
-      event.event_id,
+      "<body>\n\n\n----------\n<code>&gt;&gt;&gt;&gt; {} \
+       &lt;&lt;&lt;&lt;</code></body>",
+      serde_json::to_string(&event).unwrap(),
     );
 
     let mut tags = event
@@ -248,17 +262,7 @@ impl AsanaClient {
       .bearer_auth(&self.secrets.asana_pat)
       .json(&request_payload);
 
-    let permit = self
-      .semaphore
-      .acquire()
-      .await
-      .wrap_err("failed to acquire semaphore")?;
-    let resp = req.send().await.wrap_err("failed to fetch")?;
-    drop(permit);
-
-    let task = AsanaResponse::<AsanaTask>::decode_response(resp)
-      .await?
-      .into_result()?;
+    let task: AsanaTask = self.send_request(req).await?.into_result()?;
     tracing::Span::current().record("task_gid", &task.gid);
     tracing::info!("created task");
 
@@ -270,6 +274,172 @@ impl AsanaClient {
     }
 
     Ok(Some(task))
+  }
+
+  #[instrument(skip(self, asana_task, canon_task), fields(task_gid))]
+  pub async fn update_task(
+    &self,
+    asana_task: AsanaLinkedTask,
+    canon_task: CanonTask,
+  ) -> Result<bool> {
+    if asana_task.canon_task == canon_task {
+      return Ok(false);
+    }
+
+    let Some(new_tag) = self.find_tag_by_name("New").await? else {
+      color_eyre::eyre::bail!("failed to find \"New\" tag");
+    };
+    let Some(updated_name_tag) = self.find_tag_by_name("Updated Name").await?
+    else {
+      color_eyre::eyre::bail!("failed to find \"Updated Name\" tag");
+    };
+    let Some(updated_resources_tag) =
+      self.find_tag_by_name("Updated Resources").await?
+    else {
+      color_eyre::eyre::bail!("failed to find \"Updated Resources\" tag");
+    };
+    let meta_tags: HashSet<_> = vec![
+      new_tag.clone(),
+      updated_name_tag.clone(),
+      updated_resources_tag.clone(),
+    ]
+    .into_iter()
+    .collect();
+    let mut desired_tags = canon_task.resource_tags.clone();
+
+    let url = format!(
+      "https://app.asana.com/api/1.0/tasks/{task_gid}",
+      task_gid = asana_task.asana_task.gid
+    );
+
+    let html_notes = substitute_embedded_canon_task_in_description(
+      &asana_task.asana_task.html_notes,
+      &canon_task,
+    );
+
+    let mut request_payload = serde_json::json!({
+      "data": {
+        "html_notes": html_notes,
+      },
+    });
+
+    if asana_task.canon_task.name != canon_task.name {
+      request_payload["data"]["name"] = serde_json::json!(canon_task.name);
+    }
+
+    let req = self
+      .client
+      .put(url)
+      .query(&[("opt_fields", TASK_OPT_FIELDS)])
+      .bearer_auth(&self.secrets.asana_pat)
+      .json(&request_payload);
+
+    let task: AsanaTask = self.send_request(req).await?.into_result()?;
+    tracing::Span::current().record("task_gid", &task.gid);
+    tracing::info!("updated task");
+
+    let current_tags: HashSet<_> =
+      asana_task.asana_task.tags.clone().into_iter().collect();
+    if current_tags.contains(&new_tag) {
+      desired_tags.insert(new_tag.clone());
+    } else {
+      if current_tags.difference(&meta_tags).collect::<HashSet<_>>()
+        != desired_tags.difference(&meta_tags).collect::<HashSet<_>>()
+        || current_tags.contains(&updated_resources_tag)
+      {
+        desired_tags.insert(updated_resources_tag.clone());
+      }
+      if asana_task.canon_task.name != canon_task.name
+        || current_tags.contains(&updated_name_tag)
+      {
+        desired_tags.insert(updated_name_tag.clone());
+      }
+    }
+
+    // calculate set of tags to remove and set of tags to add
+    let mut tags_to_remove = asana_task.asana_task.tags.clone();
+    tags_to_remove.retain(|tag| !desired_tags.contains(tag));
+    let mut tags_to_add = desired_tags.clone();
+    tags_to_add.retain(|tag| !asana_task.asana_task.tags.contains(tag));
+
+    for tag in tags_to_remove {
+      self
+        .remove_tag_from_task(&task.gid, &tag.gid)
+        .await
+        .wrap_err("failed to remove tag from task")?;
+    }
+    for tag in tags_to_add {
+      self
+        .add_tag_to_task(&task.gid, &tag.gid)
+        .await
+        .wrap_err("failed to add tag to task")?;
+    }
+
+    Ok(true)
+  }
+
+  async fn remove_tag_from_task(
+    &self,
+    task_gid: &str,
+    tag_gid: &str,
+  ) -> Result<()> {
+    let url = format!(
+      "https://app.asana.com/api/1.0/tasks/{task_gid}/removeTag",
+      task_gid = task_gid
+    );
+
+    let request_payload = serde_json::json!({
+      "data": {
+        "tag": tag_gid,
+      },
+    });
+
+    let req = self
+      .client
+      .post(url)
+      .bearer_auth(&self.secrets.asana_pat)
+      .json(&request_payload);
+
+    // let _: () = self.send_request(req).await?.into_result()?;
+    let permit = self
+      .semaphore
+      .acquire()
+      .await
+      .wrap_err("failed to acquire semaphore")?;
+    let resp = req.send().await.wrap_err("failed to fetch")?;
+    drop(permit);
+
+    Ok(())
+  }
+
+  async fn add_tag_to_task(&self, task_gid: &str, tag_gid: &str) -> Result<()> {
+    let url = format!(
+      "https://app.asana.com/api/1.0/tasks/{task_gid}/addTag",
+      task_gid = task_gid
+    );
+
+    let request_payload = serde_json::json!({
+      "data": {
+        "tag": tag_gid,
+      },
+    });
+
+    let req = self
+      .client
+      .post(url)
+      .bearer_auth(&self.secrets.asana_pat)
+      .json(&request_payload);
+
+    // let _: () = self.send_request(req).await?.into_result()?;
+    let permit = self
+      .semaphore
+      .acquire()
+      .await
+      .wrap_err("failed to acquire semaphore")?;
+    req.send().await.wrap_err("failed to fetch")?;
+    drop(permit);
+
+    Ok(())
   }
 
   #[instrument(skip(self), fields(task_gid))]
@@ -295,17 +465,7 @@ impl AsanaClient {
       .bearer_auth(&self.secrets.asana_pat)
       .json(&request_payload);
 
-    let permit = self
-      .semaphore
-      .acquire()
-      .await
-      .wrap_err("failed to acquire semaphore")?;
-    let resp = req.send().await.wrap_err("failed to fetch")?;
-    drop(permit);
-
-    let task = AsanaResponse::<AsanaTask>::decode_response(resp)
-      .await?
-      .into_result()?;
+    let task: AsanaTask = self.send_request(req).await?.into_result()?;
     tracing::Span::current().record("task_gid", &task.gid);
     tracing::info!("created subtask");
 
@@ -332,15 +492,7 @@ impl AsanaClient {
       req = req.query(&[("offset", offset)])
     }
 
-    let permit = self
-      .semaphore
-      .acquire()
-      .await
-      .wrap_err("failed to acquire semaphore")?;
-    let resp = req.send().await.wrap_err("failed to fetch")?;
-    drop(permit);
-
-    AsanaResponse::decode_response(resp).await
+    self.send_request(req).await
   }
 
   #[instrument(skip(self))]
@@ -416,7 +568,7 @@ pub struct AsanaTask {
 }
 
 /// A tag from the Asana API.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, Hash, PartialEq)]
 pub struct AsanaTag {
   pub gid:  String,
   pub name: String,
@@ -441,7 +593,8 @@ impl AsanaTask {
     let start = code_element.find(">>>>").or_else(|| {
       tracing::warn!(
         "failed to extract event ID from task HTML notes: couldn't find start \
-         marker"
+         marker for task {}",
+        self.gid,
       );
       None
     })?;
@@ -453,19 +606,18 @@ impl AsanaTask {
       );
       None
     })?;
-    let id = &code_element[start..end].trim();
-
-    if id.is_empty() {
-      tracing::warn!(
-        "failed to extract event ID from task HTML notes: extracted ID is \
-         empty"
-      );
-      return None;
-    }
+    let event = serde_json::from_str(code_element[start..end].trim())
+      .map_err(|e| {
+        tracing::warn!(
+          "failed to extract event ID from task HTML notes: failed to parse \
+           event: {e}",
+        );
+      })
+      .ok()?;
 
     Some(AsanaLinkedTask {
-      task:     self,
-      event_id: id.to_string(),
+      asana_task: self,
+      canon_task: event,
     })
   }
 }
@@ -473,6 +625,29 @@ impl AsanaTask {
 /// A task from the Asana API that has been linked to a PCO event.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AsanaLinkedTask {
-  pub task:     AsanaTask,
-  pub event_id: String,
+  pub asana_task: AsanaTask,
+  pub canon_task: CanonTask,
+}
+
+fn substitute_embedded_canon_task_in_description(
+  description: &str,
+  canon_task: &CanonTask,
+) -> String {
+  tracing::info!(
+    "substituting embedded canon task in description: {description:?}"
+  );
+  let start = description.find("&gt;&gt;&gt;&gt;").unwrap_or(0) + 4 * 4;
+  let end = description
+    .find("&lt;&lt;&lt;&lt;")
+    .unwrap_or(description.len());
+  let mut new_description = description[..start].to_string();
+  new_description.push_str(&format!(
+    " {} ",
+    &serde_json::to_string(canon_task).unwrap()
+  ));
+  new_description.push_str(&description[end..]);
+  tracing::info!(
+    "substituted embedded canon task in description: {new_description:?}"
+  );
+  new_description
 }

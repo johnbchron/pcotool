@@ -1,0 +1,12 @@
+# fly.toml app configuration file generated for pcotool on 2024-08-07T13:50:14-05:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'pcotool'
+primary_region = 'dfw'
+
+[[vm]]
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024

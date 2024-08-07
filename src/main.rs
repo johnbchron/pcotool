@@ -4,12 +4,13 @@ mod asana;
 mod pco;
 mod secrets;
 
-use std::{ops::Deref, sync::Arc};
+use std::{collections::HashSet, ops::Deref, sync::Arc};
 
 use color_eyre::eyre::{Context, Error, Result};
 use futures::TryStreamExt;
 use pco::PcoEventWithRequestedResources;
 use secrets::Secrets;
+use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 pub type DateTimeUtc = chrono::DateTime<chrono::Utc>;
@@ -20,7 +21,7 @@ fn setup_tracing() {
 
   let fmt_layer = fmt::layer().with_target(false);
   let filter_layer = EnvFilter::try_from_default_env()
-    .or_else(|_| EnvFilter::try_new("pcotool=info"))
+    .or_else(|_| EnvFilter::try_new("pcotool=debug"))
     .unwrap();
 
   tracing_subscriber::registry()
@@ -30,10 +31,11 @@ fn setup_tracing() {
     .init();
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CanonTask {
   event_id:      String,
   name:          String,
-  resource_tags: Vec<asana::AsanaTag>,
+  resource_tags: HashSet<asana::AsanaTag>,
 }
 
 async fn pco_items_to_canon_task(
@@ -67,7 +69,7 @@ async fn pco_items_to_canon_task(
       None => tracing::warn!("failed to find tag for resource: {}", resource),
     }
   }
-  resource_tags.sort_by_key(|t| t.gid.clone());
+  let resource_tags = resource_tags.into_iter().collect();
 
   Ok(CanonTask {
     event_id: event.event.id.clone(),
@@ -101,13 +103,12 @@ async fn main() -> Result<()> {
   //   .unwrap();
 
   // let json_data: Vec<u8> = std::fs::read("events.json").unwrap();
-  // let events: Vec<PcoEventWithRequestedResources> =
-  //   serde_json::from_slice(&json_data).unwrap();
+  // let events: Vec<CanonTask> = serde_json::from_slice(&json_data).unwrap();
 
   tracing::info!("fetching tasks...");
-  let tasks = asana_client
-    .get_all_tasks()
-    .await?
+  let tasks = asana_client.get_all_tasks().await?;
+  tracing::info!("fetched {} task{}", tasks.len(), s(tasks.len()));
+  let tasks = tasks
     .into_iter()
     .filter_map(|t| t.into_linked_task())
     .collect::<Vec<_>>();
@@ -119,13 +120,25 @@ async fn main() -> Result<()> {
   let mut tasks_to_create: Vec<CanonTask> = Vec::new();
 
   for canon_task in events {
-    if let Some(task) = tasks.iter().find(|t| t.event_id == canon_task.event_id)
+    if let Some(task) = tasks
+      .iter()
+      .find(|t| t.canon_task.event_id == canon_task.event_id)
     {
       tasks_to_update.push((canon_task, task.clone()));
     } else {
       tasks_to_create.push(canon_task);
     }
   }
+
+  let tasks_to_create = tasks_to_create
+    .into_iter()
+    .filter(|t| !t.resource_tags.is_empty())
+    .collect::<Vec<_>>();
+  let tasks_to_update = tasks_to_update
+    .into_iter()
+    .filter(|(t, _)| !t.resource_tags.is_empty())
+    .filter(|(canon_task, asana_task)| &asana_task.canon_task != canon_task)
+    .collect::<Vec<_>>();
 
   tracing::info!(
     "sorted tasks; {} task{} to create, {} task{} to update",
@@ -139,12 +152,9 @@ async fn main() -> Result<()> {
     tracing::info!("creating tasks...");
   }
 
-  let mut jhs = Vec::new();
-  for canon_task in tasks_to_create
-    .into_iter()
-    .filter(|t| !t.resource_tags.is_empty())
-  {
-    jhs.push(tokio::spawn({
+  let mut join_handles = Vec::new();
+  for canon_task in tasks_to_create {
+    join_handles.push(tokio::spawn({
       let asana_client = asana_client.clone();
       async move {
         async move {
@@ -161,7 +171,32 @@ async fn main() -> Result<()> {
       }
     }));
   }
-  futures::future::join_all(jhs).await;
+  futures::future::join_all(join_handles).await;
+
+  if !tasks_to_update.is_empty() {
+    tracing::info!("updating tasks...");
+  }
+
+  let mut join_handles = Vec::new();
+  for (canon_task, task) in tasks_to_update {
+    join_handles.push(tokio::spawn({
+      let asana_client = asana_client.clone();
+      async move {
+        async move {
+          asana_client
+            .update_task(task, canon_task)
+            .await
+            .wrap_err("failed to update task")?;
+          Ok::<_, Error>(())
+        }
+        .await
+        .map_err(|e| {
+          tracing::error!("{:?}", e);
+        })
+      }
+    }));
+  }
+  futures::future::join_all(join_handles).await;
 
   Ok(())
 }

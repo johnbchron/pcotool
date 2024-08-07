@@ -34,19 +34,35 @@
         };
 
         deps_only = craneLib.buildDepsOnly common_args;
-        crate = craneLib.buildPackage (common_args // {
+        pcotool = craneLib.buildPackage (common_args // {
           cargoArtifacts = deps_only;
         });
+
+        crontab_file = pkgs.writeText "crontab" ''
+          */1 * * * *  ${pcotool}/bin/pcotool
+        '';
+
+        container = pkgs.dockerTools.buildLayeredImage {
+          name = "pcotool";
+          tag = "latest";
+          contents = [ pkgs.bash ];
+
+          config = {
+            Cmd = [
+              "${pkgs.supercronic}/bin/supercronic" "${crontab_file}"
+            ];
+          };
+        };
 
       in {
         devShell = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
-            jq bacon tokio-console
-            toolchain
+            jq bacon toolchain flyctl
           ];
         };
         packages = {
-          default = crate;
+          inherit pcotool container;
+          default = pcotool;
         };
       });
 }
