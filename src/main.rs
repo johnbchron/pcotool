@@ -11,6 +11,7 @@ use futures::TryStreamExt;
 use pco::PcoEventWithRequestedResources;
 use secrets::Secrets;
 use serde::{Deserialize, Serialize};
+use tokio_stream::StreamExt;
 use tracing::instrument;
 
 pub type DateTimeUtc = chrono::DateTime<chrono::Utc>;
@@ -35,6 +36,7 @@ fn setup_tracing() {
 pub struct CanonTask {
   event_id:      String,
   name:          String,
+  due_date:      DateTimeUtc,
   resource_tags: HashSet<asana::AsanaTag>,
 }
 
@@ -46,6 +48,19 @@ async fn pco_items_to_canon_task(
     tracing::warn!("failed to find event name for event: {}", event.event.id);
     format!("Nameless Asana Event: {}", event.event.id)
   });
+
+  let due_date = event
+    .instances
+    .iter()
+    .filter_map(|i| {
+      i.get_attribute("starts_at")
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+    })
+    .min()
+    .unwrap_or_else(|| {
+      tracing::warn!("failed to find due date for event: {}", event.event.id);
+      chrono::Utc::now().into()
+    });
 
   let resource_names = event
     .requested_resources
@@ -74,6 +89,7 @@ async fn pco_items_to_canon_task(
   Ok(CanonTask {
     event_id: event.event.id.clone(),
     name,
+    due_date: due_date.into(),
     resource_tags,
   })
 }
@@ -87,23 +103,21 @@ async fn main() -> Result<()> {
   let asana_client = Arc::new(crate::asana::AsanaClient::new(Secrets::new()?));
 
   let pco_client = Arc::new(pco::client::PcoClient::new(Secrets::new()?));
-  let events = pco::find_relevant_events(pco_client.clone())
-    .await
-    .and_then({
-      let asana_client = asana_client.clone();
-      move |item| {
-        let asana_client = asana_client.clone();
-        pco_items_to_canon_task(item, asana_client)
-      }
-    })
-    .try_collect::<Vec<_>>()
-    .await?;
+  let events = futures::stream::iter(
+    pco::find_relevant_events(pco_client).await?.into_iter(),
+  )
+  .then(|item| {
+    let asana_client = asana_client.clone();
+    pco_items_to_canon_task(item, asana_client)
+  })
+  .try_collect::<Vec<_>>()
+  .await?;
 
-  // std::fs::write("events.json", serde_json::to_string(&events).unwrap())
-  //   .unwrap();
+  std::fs::write("events.json", serde_json::to_string(&events).unwrap())
+    .unwrap();
 
-  // let json_data: Vec<u8> = std::fs::read("events.json").unwrap();
-  // let events: Vec<CanonTask> = serde_json::from_slice(&json_data).unwrap();
+  let json_data: Vec<u8> = std::fs::read("events.json").unwrap();
+  let events: Vec<CanonTask> = serde_json::from_slice(&json_data).unwrap();
 
   tracing::info!("fetching tasks...");
   let tasks = asana_client.get_all_tasks().await?;

@@ -244,6 +244,9 @@ impl AsanaClient {
       tracing::warn!("failed to find \"New\" tag");
     }
 
+    // YYYY-MM-DD
+    let due_on = event.due_date.format("%Y-%m-%d").to_string();
+
     let request_payload = serde_json::json!({
       "data": {
         "html_notes": html_notes,
@@ -252,6 +255,7 @@ impl AsanaClient {
           self.secrets.asana_project_gid.to_string()
         ],
         "tags": tags,
+        "due_on": due_on,
       },
     });
 
@@ -325,6 +329,11 @@ impl AsanaClient {
 
     if asana_task.canon_task.name != canon_task.name {
       request_payload["data"]["name"] = serde_json::json!(canon_task.name);
+    }
+
+    if asana_task.canon_task.due_date != canon_task.due_date {
+      request_payload["data"]["due_on"] =
+        serde_json::json!(canon_task.due_date.format("%Y-%m-%d").to_string());
     }
 
     let req = self
@@ -406,7 +415,7 @@ impl AsanaClient {
       .acquire()
       .await
       .wrap_err("failed to acquire semaphore")?;
-    let resp = req.send().await.wrap_err("failed to fetch")?;
+    let _resp = req.send().await.wrap_err("failed to fetch")?;
     drop(permit);
 
     Ok(())
