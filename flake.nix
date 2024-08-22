@@ -51,6 +51,10 @@
             Cmd = [
               "${pkgs.supercronic}/bin/supercronic" "${crontab_file}"
             ];
+            Env = [
+              "NO_COLOR=1"
+              "RUST_LOG=pcotool=debug"
+            ];
           };
         };
 
