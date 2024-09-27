@@ -226,8 +226,14 @@ impl AsanaClient {
   ) -> Result<Option<AsanaTask>> {
     let url = "https://app.asana.com/api/1.0/tasks";
 
+    let pco_view_task_url = format!(
+      "https://calendar.planningcenteronline.com/events/{}",
+      event.event_id
+    );
+
     let html_notes = format!(
-      "<body>\n\n\n----------\n<code>&gt;&gt;&gt;&gt; {} \
+      "<body><a href=\"{pco_view_task_url}\">PCO Event \
+       Link</a>\n\n----------\n<code>&gt;&gt;&gt;&gt; {} \
        &lt;&lt;&lt;&lt;</code></body>",
       serde_json::to_string(&event).unwrap(),
     );
