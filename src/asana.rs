@@ -308,6 +308,12 @@ impl AsanaClient {
     else {
       color_eyre::eyre::bail!("failed to find \"Updated Resources\" tag");
     };
+    let Some(updated_due_date_tag) =
+      self.find_tag_by_name("Updated Due Date").await?
+    else {
+      color_eyre::eyre::bail!("failed to find \"Updated Due Date\" tag");
+    };
+
     let meta_tags: HashSet<_> = vec![
       new_tag.clone(),
       updated_name_tag.clone(),
@@ -355,19 +361,29 @@ impl AsanaClient {
 
     let current_tags: HashSet<_> =
       asana_task.asana_task.tags.clone().into_iter().collect();
+    // we need the "new" tag if we had it before, and we don't need any other
+    // updated tags if the task is still new
     if current_tags.contains(&new_tag) {
       desired_tags.insert(new_tag.clone());
     } else {
+      // add "updated resources" if the sets, without meta tags, are different
       if current_tags.difference(&meta_tags).collect::<HashSet<_>>()
         != desired_tags.difference(&meta_tags).collect::<HashSet<_>>()
         || current_tags.contains(&updated_resources_tag)
       {
         desired_tags.insert(updated_resources_tag.clone());
       }
+      // add "updated name" if the names are different
       if asana_task.canon_task.name != canon_task.name
         || current_tags.contains(&updated_name_tag)
       {
         desired_tags.insert(updated_name_tag.clone());
+      }
+      // add "updated due date" if the due dates are different
+      if asana_task.canon_task.due_date != canon_task.due_date
+        || current_tags.contains(&updated_due_date_tag)
+      {
+        desired_tags.insert(updated_due_date_tag.clone());
       }
     }
 
