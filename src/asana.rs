@@ -252,7 +252,9 @@ impl AsanaClient {
     }
 
     // YYYY-MM-DD
-    let due_on = event.due_date.format("%Y-%m-%d").to_string();
+    let cst_due_date =
+      event.due_date.with_timezone(&chrono_tz::America::Chicago);
+    let due_on = cst_due_date.format("%Y-%m-%d").to_string();
 
     let request_payload = serde_json::json!({
       "data": {
