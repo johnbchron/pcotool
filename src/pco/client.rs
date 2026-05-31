@@ -137,8 +137,8 @@ impl PcoClient {
     let url = format!(
       "{URL_PREFIX}/event_instances?where[starts_at][gte]={}&\
        where[starts_at][lt]={}&offset={}",
-      start.to_rfc3339_opts(SecondsFormat::Secs, false),
-      end.to_rfc3339_opts(SecondsFormat::Secs, false),
+      start.to_rfc3339_opts(SecondsFormat::Secs, true),
+      end.to_rfc3339_opts(SecondsFormat::Secs, true),
       offset.unwrap_or(0),
     );
     self.fetch(&url, 0).await
