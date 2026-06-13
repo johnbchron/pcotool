@@ -66,6 +66,7 @@ const SUBTASK_LIST: &[&str] = &[
   "Equipment Check In",
   "Follow Up",
   "Send recording link",
+  "Save to Library",
 ];
 
 /// The error type returned by the Asana API.
