@@ -26,7 +26,7 @@ pub static TRACKED_RESOURCES: phf::Map<&'static str, &'static str> = phf_map! {
   "Room 500" => "500",
   "Second Floor Classroom" => "2nd Floor",
 
-  "ATS Room" => "ATS",
+  "ADS Room" => "ADS",
   "Underground Auditorium" => "UA",
 
   "Digital Recorder" => "Portable",
