@@ -477,12 +477,66 @@ impl AsanaClient {
     Ok(())
   }
 
+  /// Create a subtask, retrying transient failures (5xx, 429, transport
+  /// errors) with exponential backoff.
+  ///
+  /// Subtask creation is not idempotent: a request that times out may still
+  /// have succeeded server-side. Before each retry we check whether a subtask
+  /// with this name already exists and return it instead of creating a
+  /// duplicate.
   #[instrument(skip(self), fields(task_gid))]
   pub async fn create_subtask(
     &self,
     parent_task_gid: &str,
     name: &str,
   ) -> Result<AsanaTask> {
+    const MAX_ATTEMPTS: u32 = 5;
+
+    let mut attempt = 0;
+    loop {
+      attempt += 1;
+      let (error, retry_after) =
+        match self.try_create_subtask(parent_task_gid, name).await? {
+          SubtaskAttempt::Created(task) => {
+            tracing::Span::current().record("task_gid", &task.gid);
+            tracing::info!("created subtask");
+            return Ok(task);
+          }
+          SubtaskAttempt::Retryable { error, retry_after } => {
+            if attempt >= MAX_ATTEMPTS {
+              return Err(error.wrap_err(format!(
+                "giving up on subtask after {attempt} attempts"
+              )));
+            }
+            (error, retry_after)
+          }
+        };
+
+      let delay = retry_after
+        .unwrap_or_else(|| std::time::Duration::from_secs(1 << attempt));
+      tracing::warn!(
+        attempt,
+        ?delay,
+        "transient error creating subtask, retrying: {error}"
+      );
+      tokio::time::sleep(delay).await;
+
+      // the failed request may have gone through anyway
+      if let Some(existing) =
+        self.find_subtask_by_name(parent_task_gid, name).await?
+      {
+        tracing::Span::current().record("task_gid", &existing.gid);
+        tracing::info!("subtask already exists after failed request");
+        return Ok(existing);
+      }
+    }
+  }
+
+  async fn try_create_subtask(
+    &self,
+    parent_task_gid: &str,
+    name: &str,
+  ) -> Result<SubtaskAttempt> {
     let url = format!(
       "https://app.asana.com/api/1.0/tasks/{parent_task_gid}/subtasks",
     );
@@ -500,11 +554,69 @@ impl AsanaClient {
       .bearer_auth(&self.secrets.asana_pat)
       .json(&request_payload);
 
-    let task: AsanaTask = self.send_request(req).await?.into_result()?;
-    tracing::Span::current().record("task_gid", &task.gid);
-    tracing::info!("created subtask");
+    let permit = self
+      .semaphore
+      .acquire()
+      .await
+      .wrap_err("failed to acquire semaphore")?;
+    let resp = match req.send().await {
+      Ok(resp) => resp,
+      Err(e) => {
+        return Ok(SubtaskAttempt::Retryable {
+          error:       color_eyre::eyre::Report::new(e)
+            .wrap_err("failed to fetch"),
+          retry_after: None,
+        });
+      }
+    };
+    drop(permit);
 
-    Ok(task)
+    let status = resp.status();
+    let retry_after = resp
+      .headers()
+      .get(reqwest::header::RETRY_AFTER)
+      .and_then(|v| v.to_str().ok())
+      .and_then(|v| v.parse::<u64>().ok())
+      .map(std::time::Duration::from_secs);
+    let retryable = status.is_server_error()
+      || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+
+    match AsanaResponse::<AsanaTask>::decode_response(resp)
+      .await
+      .and_then(AsanaResponse::into_result)
+    {
+      Ok(task) => Ok(SubtaskAttempt::Created(task)),
+      Err(error) if retryable => Ok(SubtaskAttempt::Retryable {
+        error: error.wrap_err(format!("HTTP {status}")),
+        retry_after,
+      }),
+      Err(error) => Err(error.wrap_err(format!("HTTP {status}"))),
+    }
+  }
+
+  /// Find an existing subtask of `parent_task_gid` with the given name.
+  async fn find_subtask_by_name(
+    &self,
+    parent_task_gid: &str,
+    name: &str,
+  ) -> Result<Option<AsanaTask>> {
+    let url = format!(
+      "https://app.asana.com/api/1.0/tasks/{parent_task_gid}/subtasks",
+    );
+
+    let req = self
+      .client
+      .get(url)
+      .bearer_auth(&self.secrets.asana_pat)
+      .query(&[("opt_fields", TASK_OPT_FIELDS), ("limit", "100")]);
+
+    let subtasks: Vec<AsanaTask> = self
+      .send_request(req)
+      .await?
+      .into_result()
+      .wrap_err("failed to list subtasks")?;
+
+    Ok(subtasks.into_iter().find(|t| t.name == name))
   }
 
   /// Fetch tags from the Asana API.
@@ -593,6 +705,15 @@ impl AsanaClient {
   }
 }
 
+/// The outcome of a single subtask creation attempt.
+enum SubtaskAttempt {
+  Created(AsanaTask),
+  Retryable {
+    error:       color_eyre::eyre::Report,
+    retry_after: Option<std::time::Duration>,
+  },
+}
+
 /// A task from the Asana API.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AsanaTask {
@@ -676,10 +797,8 @@ fn substitute_embedded_canon_task_in_description(
     .find("&lt;&lt;&lt;&lt;")
     .unwrap_or(description.len());
   let mut new_description = description[..start].to_string();
-  new_description.push_str(&format!(
-    " {} ",
-    &serde_json::to_string(canon_task).unwrap()
-  ));
+  new_description
+    .push_str(&format!(" {} ", serde_json::to_string(canon_task).unwrap()));
   new_description.push_str(&description[end..]);
   tracing::info!(
     "substituted embedded canon task in description: {new_description:?}"
